@@ -19,8 +19,12 @@ def softmax(x: Tensor, dim: int = -1) -> Tensor:
     """
     # TODO: Implement numerically stable softmax. You can re-use the same one 
     # used in part 2. But for this problem, you need to implement a numerically stable version to pass harder tests.
-    
-    raise NotImplementedError("Implement softmax")
+    # Subtract max for numerical stability before exponentiating
+    max_x, _ = x.max(dim=dim, keepdim=True)
+    shifted = x - max_x
+    exp_x = torch.exp(shifted)
+    sum_exp = exp_x.sum(dim=dim, keepdim=True)
+    return exp_x / sum_exp
 
 
 def cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
@@ -36,8 +40,22 @@ def cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
         Scalar tensor containing the mean cross-entropy loss
     """
     # TODO: Implement cross-entropy loss
+    # Cross-entropy = -log(softmax(logits)[target])
+    # Numerically stable: use log_softmax = log(softmax) = logits - log(sum(exp(logits)))
+    # Then take negative log likelihood: -log_softmax[target]
     
-    raise NotImplementedError("Implement cross_entropy")
+    # Compute log_softmax (numerically stable)
+    max_logits, _ = logits.max(dim=-1, keepdim=True)
+    shifted = logits - max_logits
+    exp_shifted = torch.exp(shifted)
+    sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
+    log_softmax = shifted - torch.log(sum_exp)
+    
+    # Select log probability for target class
+    nll = -log_softmax.gather(1, targets.unsqueeze(1)).squeeze(1)
+    
+    # Return mean loss
+    return nll.mean()
 
 
 def gradient_clipping(parameters, max_norm: float) -> Tensor:
@@ -52,8 +70,25 @@ def gradient_clipping(parameters, max_norm: float) -> Tensor:
         The total norm of the gradients before clipping
     """
     # TODO: Implement gradient clipping
+    # Compute global L2 norm of all gradients
+    # Collect all gradient norms squared
+    grads = [p.grad for p in parameters if p.grad is not None]
     
-    raise NotImplementedError("Implement gradient_clipping")
+    if len(grads) == 0:
+        return torch.tensor(0.0)
+    
+    # Compute total norm squared
+    total_norm_sq = sum(g.norm(2) ** 2 for g in grads)
+    total_norm = torch.sqrt(total_norm_sq)
+    
+    # Clip if norm exceeds max_norm
+    clip_coef = max_norm / (total_norm + 1e-6)
+    if clip_coef < 1.0:
+        for param in parameters:
+            if param.grad is not None:
+                param.grad.data.mul_(clip_coef)
+    
+    return total_norm
 
 
 def token_accuracy(logits: Tensor, targets: Tensor, ignore_index: int = -100) -> Tensor:
@@ -84,8 +119,20 @@ def token_accuracy(logits: Tensor, targets: Tensor, ignore_index: int = -100) ->
         tensor(0.6667)  # 2 out of 3 correct
     """
     # TODO: Implement token accuracy
+    # Get predictions (argmax of logits)
+    pred = logits.argmax(dim=-1)
     
-    raise NotImplementedError("Implement token_accuracy")
+    # Create mask for valid (non-ignored) positions
+    valid_mask = targets != ignore_index
+    
+    # Count correct predictions only for valid positions
+    if valid_mask.sum() == 0:
+        return torch.tensor(0.0)
+    
+    correct = (pred[valid_mask] == targets[valid_mask]).sum().float()
+    total_valid = valid_mask.sum().float()
+    
+    return correct / total_valid
 
 
 def perplexity(logits: Tensor, targets: Tensor, ignore_index: int = -100) -> Tensor:
@@ -119,5 +166,27 @@ def perplexity(logits: Tensor, targets: Tensor, ignore_index: int = -100) -> Ten
         tensor(3.)  # Equal to vocab_size (worst case for uniform)
     """
     # TODO: Implement perplexity
+    # Perplexity = exp(cross_entropy_loss)
+    # Need to compute cross-entropy only on non-ignored targets
     
-    raise NotImplementedError("Implement perplexity")
+    # Create mask for valid positions
+    valid_mask = targets != ignore_index
+    
+    if valid_mask.sum() == 0:
+        return torch.tensor(1.0)
+    
+    # Filter to only valid logits and targets
+    valid_logits = logits[valid_mask]
+    valid_targets = targets[valid_mask]
+    
+    # Compute cross-entropy on valid positions
+    max_logits, _ = valid_logits.max(dim=-1, keepdim=True)
+    shifted = valid_logits - max_logits
+    exp_shifted = torch.exp(shifted)
+    sum_exp = exp_shifted.sum(dim=-1, keepdim=True)
+    log_softmax = shifted - torch.log(sum_exp)
+    
+    nll = -log_softmax.gather(1, valid_targets.unsqueeze(1)).squeeze(1)
+    ce_loss = nll.mean()
+    
+    return torch.exp(ce_loss)
