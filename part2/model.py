@@ -51,6 +51,8 @@ class Linear(nn.Module):
             Output tensor of shape (..., d_out)
         """
         # TODO: Implement linear transformation
+
+        return x @ self.weight.T
         
         raise NotImplementedError("Implement Linear.forward")
 
@@ -77,6 +79,8 @@ class Embedding(nn.Module):
         self.d_model = d_model
         # Embedding weight matrix of shape (vocab_size, d_model)
         # TODO: Implement embedding
+        self.weight = nn.Parameter(torch.empty(vocab_size, d_model))
+
         self._init_weights()
     
     def _init_weights(self):
@@ -94,8 +98,7 @@ class Embedding(nn.Module):
             Tensor of embeddings of shape (batch, seq_len, d_model)
         """
         # TODO: Implement embedding lookup
-        
-        raise NotImplementedError("Implement Embedding.forward")
+        return self.weight[token_ids]
 
 
 # =============================================================================
@@ -141,8 +144,9 @@ class RMSNorm(nn.Module):
             Normalized tensor of same shape
         """
         # TODO: Implement RMS normalization
+
+        return x / torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps) * self.weight
         
-        raise NotImplementedError("Implement RMSNorm.forward")
 
 
 # =============================================================================
@@ -161,8 +165,12 @@ def softmax(x: Tensor, dim: int = -1) -> Tensor:
         Tensor of same shape as input with softmax applied along dim
     """
     # TODO: Implement numerically stable softmax
-    
-    raise NotImplementedError("Implement softmax")
+    # Subtract max for numerical stability, then apply exp and normalize.
+    x_max, _ = torch.max(x, dim=dim, keepdim=True)
+    x_stable = x - x_max
+    exp_x = torch.exp(x_stable)
+    sum_exp = torch.sum(exp_x, dim=dim, keepdim=True)
+    return exp_x / sum_exp
 
 # =============================================================================
 # SiLU activation (helper for SwiGLU)
@@ -180,8 +188,8 @@ def silu(x: Tensor) -> Tensor:
         Tensor with SiLU applied element-wise
     """
     # TODO: Implement SiLU activation
-    
-    raise NotImplementedError("Implement silu")
+
+    return x * torch.sigmoid(x)
 
 
 # =============================================================================
@@ -226,8 +234,9 @@ class SwiGLU(nn.Module):
             Output tensor of shape (..., d_model)
         """
         # TODO: Implement SwiGLU
+
+        return self.w2(silu(self.w1(x)) * self.w3(x))
         
-        raise NotImplementedError("Implement SwiGLU.forward")
 
 
 # =============================================================================
@@ -305,7 +314,10 @@ class RotaryPositionEmbedding(nn.Module):
         # Precompute frequencies
         # inv_freq shape: (d_model // 2,)
         # TODO: Implement inv_freq
+
+        inv_freq = 1.0 / (theta ** (torch.arange(0, d_model, 2) / d_model))
         self.register_buffer("inv_freq", inv_freq)
+
         
         # Precompute cos and sin for all positions
         self._precompute_cache(max_seq_len)
@@ -351,8 +363,10 @@ class RotaryPositionEmbedding(nn.Module):
             return torch.cat([-x2, x1], dim=-1)
         """
         # TODO: Implement rotate_half
-        
-        raise NotImplementedError("Implement _rotate_half")
+        d_half = x.shape[-1] // 2
+        x1 = x[..., :d_half]
+        x2 = x[..., d_half:]
+        return torch.cat([-x2, x1], dim=-1)
     
     def forward(self, x: Tensor, token_positions: Tensor) -> Tensor:
         """
@@ -392,7 +406,35 @@ class RotaryPositionEmbedding(nn.Module):
         """
         # TODO: Implement RoPE forward pass
         
-        raise NotImplementedError("Implement RotaryPositionEmbedding.forward")
+        # x can be (batch, seq_len, d_model) or (batch, num_heads, seq_len, d_model)
+        if x.dim() == 3:
+            batch_size, seq_len, d = x.shape
+        elif x.dim() == 4:
+            batch_size, num_heads, seq_len, d = x.shape
+        else:
+            raise ValueError(f"Unexpected x.ndim={x.dim()}, expected 3 or 4.")
+
+        # Get cos/sin for given positions
+        # token_positions: (seq_len,) or (batch, seq_len)
+        if token_positions.dim() == 1:
+            # Shared positions for all batch elements
+            cos = self.cos_cached[token_positions]  # (seq_len, d)
+            sin = self.sin_cached[token_positions]  # (seq_len, d)
+            if x.dim() == 3:
+                cos = cos.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, seq_len, d)
+                sin = sin.unsqueeze(0).expand(batch_size, -1, -1)
+            else:  # x.dim() == 4
+                cos = cos.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)  # (batch, 1, seq_len, d)
+                sin = sin.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+        else:
+            # Per-batch positions: (batch, seq_len)
+            cos = self.cos_cached[token_positions]  # (batch, seq_len, d)
+            sin = self.sin_cached[token_positions]  # (batch, seq_len, d)
+            if x.dim() == 4:
+                cos = cos.unsqueeze(1)  # (batch, 1, seq_len, d)
+                sin = sin.unsqueeze(1)  # (batch, 1, seq_len, d)
+
+        return x * cos + self._rotate_half(x) * sin
 
 
 def apply_rope(x: Tensor, d_model: int, theta: float, max_seq_len: int, token_positions: Tensor) -> Tensor:
@@ -442,8 +484,24 @@ def scaled_dot_product_attention(
     d_k = Q.shape[-1]
     
     # TODO: Implement scaled dot-product attention
+    # 1. Compute attention scores: Q @ K^T / sqrt(d_k)
+    scale = math.sqrt(d_k)
+    scores = Q @ K.transpose(-2, -1) / scale  # (..., seq_len_q, seq_len_k)
     
-    raise NotImplementedError("Implement scaled_dot_product_attention")
+    # 2. Apply mask (False = masked, True = keep)
+    if mask is not None:
+        # Broadcast mask up to scores.ndim
+        while mask.dim() < scores.dim():
+            mask = mask.unsqueeze(1)
+        scores = scores.masked_fill(~mask, float("-inf"))
+    
+    # 3. Softmax over keys dimension
+    attn_weights = softmax(scores, dim=-1)
+    
+    # 4. Weighted sum of values
+    return attn_weights @ V
+
+    
 
 
 # =============================================================================
@@ -499,8 +557,28 @@ class MultiHeadSelfAttention(nn.Module):
         batch_size, seq_len, _ = x.shape
         
         # TODO: Implement multi-head self-attention
+        # 1. Project to Q, K, V
+        Q = self.q_proj(x)  # (batch, seq_len, d_model)
+        K = self.k_proj(x)  # (batch, seq_len, d_model)
+        V = self.v_proj(x)  # (batch, seq_len, d_model)
         
-        raise NotImplementedError("Implement MultiHeadSelfAttention.forward")
+        # 2. Reshape to separate heads: (batch, seq_len, d_model) -> (batch, num_heads, seq_len, d_k)
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)  # (batch, num_heads, seq_len, d_k)
+        K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)  # (batch, num_heads, seq_len, d_k)
+        V = V.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)  # (batch, num_heads, seq_len, d_k)
+        
+        # 3. Create causal mask and apply attention
+        mask = self._create_causal_mask(seq_len, x.device)  # (seq_len, seq_len)
+        attn_output = scaled_dot_product_attention(Q, K, V, mask)  # (batch, num_heads, seq_len, d_k)
+        
+        # 4. Reshape back: (batch, num_heads, seq_len, d_k) -> (batch, seq_len, d_model)
+        attn_output = attn_output.transpose(1, 2).contiguous()  # (batch, seq_len, num_heads, d_k)
+        attn_output = attn_output.view(batch_size, seq_len, self.d_model)  # (batch, seq_len, d_model)
+        
+        # 5. Apply output projection
+        output = self.output_proj(attn_output)  # (batch, seq_len, d_model)
+        
+        return output
 
 
 class MultiHeadSelfAttentionWithRoPE(nn.Module):
@@ -563,8 +641,29 @@ class MultiHeadSelfAttentionWithRoPE(nn.Module):
             token_positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
         
         # TODO: Implement multi-head self-attention with RoPE
+        # 1. Project to Q, K, V
+        Q = self.q_proj(x)  # (batch, seq_len, d_model)
+        K = self.k_proj(x)
+        V = self.v_proj(x)
         
-        raise NotImplementedError("Implement MultiHeadSelfAttentionWithRoPE.forward")
+        # 2. Reshape to separate heads
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)  # (batch, heads, seq, d_k)
+        K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        
+        # 3. Apply RoPE to query and key
+        Q = self.rope(Q, token_positions)
+        K = self.rope(K, token_positions)
+        
+        # 4. Create causal mask and apply attention
+        mask = self._create_causal_mask(seq_len, x.device)  # (seq, seq)
+        attn_output = scaled_dot_product_attention(Q, K, V, mask)  # (batch, heads, seq, d_k)
+        
+        # 5. Reshape back and project out
+        attn_output = attn_output.transpose(1, 2).contiguous()  # (batch, seq, heads, d_k)
+        attn_output = attn_output.view(batch_size, seq_len, self.d_model)  # (batch, seq, d_model)
+        
+        return self.output_proj(attn_output)
 
 
 # =============================================================================
@@ -624,8 +723,18 @@ class TransformerBlock(nn.Module):
             Output tensor of shape (batch, seq_len, d_model)
         """
         # TODO: Implement Transformer block forward pass
+        # Pre-LN: normalize, then apply sublayer, then add residual.
+        # 1. Self-attention with RoPE
+        attn_input = self.ln1(x)
+        attn_output = self.attn(attn_input, token_positions)
+        x = x + attn_output
         
-        raise NotImplementedError("Implement TransformerBlock.forward")
+        # 2. Feed-forward network
+        ffn_input = self.ln2(x)
+        ffn_output = self.ffn(ffn_input)
+        x = x + ffn_output
+        
+        return x
 
 
 # =============================================================================
@@ -708,8 +817,19 @@ class TransformerLM(nn.Module):
             token_positions = torch.arange(seq_len, device=token_ids.device).unsqueeze(0).expand(batch_size, -1)
         
         # TODO: Implement TransformerLM forward pass
+        # 1. Embed tokens
+        x = self.token_embeddings(token_ids)  # (batch, seq_len, d_model)
         
-        raise NotImplementedError("Implement TransformerLM.forward")
+        # 2. Pass through Transformer blocks
+        for layer in self.layers:
+            x = layer(x, token_positions)
+        
+        # 3. Final layer norm
+        x = self.final_ln(x)
+        
+        # 4. Output projection to vocabulary logits
+        logits = self.output(x)  # (batch, seq_len, vocab_size)
+        return logits
     
     def load_weights(self, state_dict: dict):
         """
@@ -802,8 +922,22 @@ def count_flops_per_token(
         Approximate FLOPs per token
     """
     # TODO: Implement FLOPs counting
+    # Rough estimate based on common Transformer accounting.
+    L = context_length
+    d = d_model
     
-    raise NotImplementedError("Implement count_flops_per_token")
+    # Output projection per token: d_model * vocab_size MACs -> 2 FLOPs each
+    output_flops = 2 * d * vocab_size
+    
+    # Per-layer FLOPs for one token (approximate):
+    # - Q,K,V projections + output projection: 4 * d^2 MACs
+    # - Attention scores and weighted sum over context: 2 * L * d MACs
+    # - FFN (SwiGLU): ~3 * d * d_ff MACs
+    per_layer_macs = 4 * d * d + 2 * L * d + 3 * d * d_ff
+    per_layer_flops = 2 * per_layer_macs
+    
+    total_flops = output_flops + num_layers * per_layer_flops
+    return int(total_flops)
 
 
 def estimate_memory_bytes(
@@ -827,5 +961,18 @@ def estimate_memory_bytes(
         Approximate memory in bytes
     """
     # TODO: Implement memory estimation
+    # Token embeddings and output projection
+    embed_params = vocab_size * d_model
+    output_params = d_model * vocab_size
     
-    raise NotImplementedError("Implement estimate_memory_bytes")
+    # Per-layer parameters:
+    # - 2 RMSNorm weights: 2 * d_model
+    # - 4 attention projections: 4 * d_model * d_model
+    # - SwiGLU FFN: w1 (d_ff*d_model), w2 (d_model*d_ff), w3 (d_ff*d_model)
+    ffn_params = 3 * d_model * d_ff
+    attn_params = 4 * d_model * d_model
+    norm_params = 2 * d_model
+    per_layer_params = norm_params + attn_params + ffn_params
+    
+    total_params = embed_params + output_params + num_layers * per_layer_params
+    return total_params * dtype_bytes
