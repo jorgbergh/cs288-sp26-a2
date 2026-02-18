@@ -487,10 +487,17 @@ def scaled_dot_product_attention(
     
     # 2. Apply mask (True = keep, False = mask out)
     if mask is not None:
+        # Ensure mask shape matches scores for proper broadcasting
         scores = scores.masked_fill(~mask, float("-inf"))
     
     # 3. Softmax over keys and weight values
     attn = softmax(scores, dim=-1)
+    
+    # Handle case where all positions are masked (all -inf) to avoid NaN
+    # When all scores are -inf, softmax produces NaN. Set to zeros.
+    attn = torch.nan_to_num(attn, nan=0.0)
+    
+    # 4. Weight values by attention
     return attn @ V
 
     
