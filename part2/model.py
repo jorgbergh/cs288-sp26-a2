@@ -51,10 +51,9 @@ class Linear(nn.Module):
             Output tensor of shape (..., d_out)
         """
         # TODO: Implement linear transformation
-
+        # x has shape (..., d_in), weight has shape (d_out, d_in)
+        # We want y = x @ W^T => (..., d_in) @ (d_in, d_out) -> (..., d_out)
         return x @ self.weight.T
-        
-        raise NotImplementedError("Implement Linear.forward")
 
 
 # =============================================================================
@@ -165,11 +164,11 @@ def softmax(x: Tensor, dim: int = -1) -> Tensor:
         Tensor of same shape as input with softmax applied along dim
     """
     # TODO: Implement numerically stable softmax
-    # Subtract max for numerical stability, then apply exp and normalize.
-    x_max, _ = torch.max(x, dim=dim, keepdim=True)
-    x_stable = x - x_max
-    exp_x = torch.exp(x_stable)
-    sum_exp = torch.sum(exp_x, dim=dim, keepdim=True)
+    # Subtract max for numerical stability before exponentiating
+    max_x, _ = x.max(dim=dim, keepdim=True)
+    shifted = x - max_x
+    exp_x = torch.exp(shifted)
+    sum_exp = exp_x.sum(dim=dim, keepdim=True)
     return exp_x / sum_exp
 
 # =============================================================================
@@ -188,7 +187,6 @@ def silu(x: Tensor) -> Tensor:
         Tensor with SiLU applied element-wise
     """
     # TODO: Implement SiLU activation
-
     return x * torch.sigmoid(x)
 
 
@@ -484,22 +482,16 @@ def scaled_dot_product_attention(
     d_k = Q.shape[-1]
     
     # TODO: Implement scaled dot-product attention
-    # 1. Compute attention scores: Q @ K^T / sqrt(d_k)
-    scale = math.sqrt(d_k)
-    scores = Q @ K.transpose(-2, -1) / scale  # (..., seq_len_q, seq_len_k)
+    # 1. Compute attention scores
+    scores = Q @ K.transpose(-2, -1) / math.sqrt(d_k)  # (..., seq_q, seq_k)
     
-    # 2. Apply mask (False = masked, True = keep)
+    # 2. Apply mask (True = keep, False = mask out)
     if mask is not None:
-        # Broadcast mask up to scores.ndim
-        while mask.dim() < scores.dim():
-            mask = mask.unsqueeze(1)
         scores = scores.masked_fill(~mask, float("-inf"))
     
-    # 3. Softmax over keys dimension
-    attn_weights = softmax(scores, dim=-1)
-    
-    # 4. Weighted sum of values
-    return attn_weights @ V
+    # 3. Softmax over keys and weight values
+    attn = softmax(scores, dim=-1)
+    return attn @ V
 
     
 
@@ -646,23 +638,24 @@ class MultiHeadSelfAttentionWithRoPE(nn.Module):
         K = self.k_proj(x)
         V = self.v_proj(x)
         
-        # 2. Reshape to separate heads
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)  # (batch, heads, seq, d_k)
+        # 2. Reshape to separate heads: (batch, seq_len, d_model) -> (batch, num_heads, seq_len, d_k)
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
         K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
         
-        # 3. Apply RoPE to query and key
+        # 3. Apply RoPE to Q and K
         Q = self.rope(Q, token_positions)
         K = self.rope(K, token_positions)
         
         # 4. Create causal mask and apply attention
-        mask = self._create_causal_mask(seq_len, x.device)  # (seq, seq)
-        attn_output = scaled_dot_product_attention(Q, K, V, mask)  # (batch, heads, seq, d_k)
+        mask = self._create_causal_mask(seq_len, x.device)  # (seq_len, seq_len)
+        attn_output = scaled_dot_product_attention(Q, K, V, mask)  # (batch, num_heads, seq_len, d_k)
         
-        # 5. Reshape back and project out
-        attn_output = attn_output.transpose(1, 2).contiguous()  # (batch, seq, heads, d_k)
-        attn_output = attn_output.view(batch_size, seq_len, self.d_model)  # (batch, seq, d_model)
+        # 5. Reshape back to (batch, seq_len, d_model)
+        attn_output = attn_output.transpose(1, 2).contiguous()  # (batch, seq_len, num_heads, d_k)
+        attn_output = attn_output.view(batch_size, seq_len, self.d_model)
         
+        # 6. Output projection
         return self.output_proj(attn_output)
 
 
@@ -723,16 +716,16 @@ class TransformerBlock(nn.Module):
             Output tensor of shape (batch, seq_len, d_model)
         """
         # TODO: Implement Transformer block forward pass
-        # Pre-LN: normalize, then apply sublayer, then add residual.
-        # 1. Self-attention with RoPE
-        attn_input = self.ln1(x)
-        attn_output = self.attn(attn_input, token_positions)
-        x = x + attn_output
+        # Pre-LN Transformer block:
+        # x = x + Attention(RMSNorm(x))
+        # x = x + FFN(RMSNorm(x))
+        attn_in = self.ln1(x)
+        attn_out = self.attn(attn_in, token_positions)
+        x = x + attn_out
         
-        # 2. Feed-forward network
-        ffn_input = self.ln2(x)
-        ffn_output = self.ffn(ffn_input)
-        x = x + ffn_output
+        ffn_in = self.ln2(x)
+        ffn_out = self.ffn(ffn_in)
+        x = x + ffn_out
         
         return x
 
@@ -817,17 +810,17 @@ class TransformerLM(nn.Module):
             token_positions = torch.arange(seq_len, device=token_ids.device).unsqueeze(0).expand(batch_size, -1)
         
         # TODO: Implement TransformerLM forward pass
-        # 1. Embed tokens
+        # 1. Token embeddings
         x = self.token_embeddings(token_ids)  # (batch, seq_len, d_model)
         
-        # 2. Pass through Transformer blocks
+        # 2. Transformer blocks
         for layer in self.layers:
             x = layer(x, token_positions)
         
         # 3. Final layer norm
         x = self.final_ln(x)
         
-        # 4. Output projection to vocabulary logits
+        # 4. Output projection to vocabulary
         logits = self.output(x)  # (batch, seq_len, vocab_size)
         return logits
     
@@ -922,21 +915,21 @@ def count_flops_per_token(
         Approximate FLOPs per token
     """
     # TODO: Implement FLOPs counting
-    # Rough estimate based on common Transformer accounting.
-    L = context_length
-    d = d_model
+    # Rough estimate based on:
+    # - Attention projections (Q, K, V, output): 4 * d_model^2 MACs per token
+    # - Attention score/value operations: ~2 * context_length * d_model MACs per token
+    # - FFN (SwiGLU): 3 linear layers of size d_model x d_ff (and back): ~3 * 2 * d_model * d_ff MACs
+    # Each MAC ~ 2 FLOPs.
+    attn_proj_flops = 4 * d_model * d_model * 2
+    attn_scores_flops = 2 * context_length * d_model
+    ffn_flops = 6 * d_model * d_ff
+    per_layer_flops = attn_proj_flops + attn_scores_flops + ffn_flops
     
-    # Output projection per token: d_model * vocab_size MACs -> 2 FLOPs each
-    output_flops = 2 * d * vocab_size
+    total_flops = num_layers * per_layer_flops
     
-    # Per-layer FLOPs for one token (approximate):
-    # - Q,K,V projections + output projection: 4 * d^2 MACs
-    # - Attention scores and weighted sum over context: 2 * L * d MACs
-    # - FFN (SwiGLU): ~3 * d * d_ff MACs
-    per_layer_macs = 4 * d * d + 2 * L * d + 3 * d * d_ff
-    per_layer_flops = 2 * per_layer_macs
+    # Include output projection cost per token
+    total_flops += 2 * d_model * vocab_size
     
-    total_flops = output_flops + num_layers * per_layer_flops
     return int(total_flops)
 
 
@@ -961,18 +954,17 @@ def estimate_memory_bytes(
         Approximate memory in bytes
     """
     # TODO: Implement memory estimation
-    # Token embeddings and output projection
-    embed_params = vocab_size * d_model
-    output_params = d_model * vocab_size
+    # Mirror the parameter counting logic from tests, then scale by dtype_bytes.
+    # Token embeddings and output projection (not tied)
+    params = vocab_size * d_model  # token_embeddings
+    params += vocab_size * d_model  # output projection
+    params += d_model  # final layer norm
     
     # Per-layer parameters:
-    # - 2 RMSNorm weights: 2 * d_model
-    # - 4 attention projections: 4 * d_model * d_model
-    # - SwiGLU FFN: w1 (d_ff*d_model), w2 (d_model*d_ff), w3 (d_ff*d_model)
-    ffn_params = 3 * d_model * d_ff
-    attn_params = 4 * d_model * d_model
-    norm_params = 2 * d_model
-    per_layer_params = norm_params + attn_params + ffn_params
+    # - ln1, ln2: 2 * d_model
+    # - attention projections: 4 * d_model * d_model
+    # - ffn (SwiGLU): 3 * d_model * d_ff
+    per_layer_params = 2 * d_model + 4 * d_model * d_model + 3 * d_model * d_ff
+    params += num_layers * per_layer_params
     
-    total_params = embed_params + output_params + num_layers * per_layer_params
-    return total_params * dtype_bytes
+    return int(params * dtype_bytes)
