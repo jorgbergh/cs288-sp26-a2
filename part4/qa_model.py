@@ -17,7 +17,7 @@ from part2.model import Linear
 
 
 class TransformerForMultipleChoice(nn.Module):
-    def __init__(self, transformer_lm, hidden_size: int, num_choices: int = 4, pooling: str = "last", freeze_backbone: bool = False):
+    def __init__(self, transformer_lm, hidden_size: int, num_choices: int = 4, pooling: str = "mean", freeze_backbone: bool = False):
         super().__init__()
         self.transformer = transformer_lm
         self.hidden_size = hidden_size

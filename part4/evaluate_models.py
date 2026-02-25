@@ -87,9 +87,11 @@ def get_config(mode: str = "full"):
             "d_ff": 1024,
             "context_length": 256,
             "pretrain_epochs": 1,  # 1 epoch over 100k stories is substantial
-            "finetune_epochs": 3,
+            # More QA epochs to improve downstream accuracy
+            "finetune_epochs": 8,
             "batch_size": 16,
-            "learning_rate": 3e-4,
+            # Slightly lower LR for more stable training with extra epochs
+            "learning_rate": 2e-4,
         }
 
 
@@ -237,7 +239,9 @@ def finetune_qa_model(pretrained_model, tokenizer, config: dict, device: str = "
         transformer_lm=pretrained_model,
         hidden_size=pretrained_model.d_model,
         num_choices=4,
-        pooling="last",
+        # Use mean pooling over the sequence, which often works better
+        # than relying on the last token only for QA-style tasks.
+        pooling="mean",
         freeze_backbone=False,  # Fine-tune entire model
     ).to(device)
     
